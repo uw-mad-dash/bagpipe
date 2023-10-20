@@ -1,0 +1,1485 @@
+import os
+import sys
+import time
+import copy
+import queue
+import logging
+import argparse
+import threading
+import numpy as np
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.distributed.rpc as rpc
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+import utils
+import s3_utils
+from operator import itemgetter
+
+from subprocess import call
+
+
+class DistTrainModel(nn.Module):
+    def __init__(
+        self,
+        emb_size=1,
+        ln_deep=None,
+        ln_wide=None,
+        feature_interaction="dot",
+        interact_itself=False,
+        loss_function="bce",
+        worker_id=0,
+        lookahead_value=200,
+        cache_size=25000,
+        mini_batch_size=128,
+        ln_emb=[],
+        training_worker_id=0,
+        device="cuda:0",
+        oracle_prefix=None,
+        emb_prefix=None,
+        trainer_prefix=None,
+        trainer_world_size=None,
+        cleanup_batch_proportion=0.25,
+    ):
+        super(DistTrainModel, self).__init__()
+        """
+        Args:
+            emb_size: Size of for each sparse embedding
+            ln_top (np.array): Structure of top MLP
+            ln_bot (np.array): Structure of bottom MLP
+            sigmoid_bot (int): Integer for listing the location of bottom
+            sigmoid_top (int): Integer for listing the location of the top
+        Returns:
+            None
+        """
+        self.emb_size = emb_size
+        self.ln_deep = ln_deep
+        self.ln_wide = ln_wide
+        self.feature_interaction = feature_interaction
+        self.interact_itself = interact_itself
+        self.lookahead_value = lookahead_value
+        self.mini_batch_size = mini_batch_size
+        self.ln_emb = ln_emb
+        self.trainer_world_size = trainer_world_size
+        self.training_worker_id = training_worker_id
+        self.device = device
+
+        self.deep_mlp = self.create_deep_mlp(self.ln_deep)
+        print(self.deep_mlp)
+        self.wide_linear = self.create_wide(self.ln_wide, False)
+        print(self.wide_linear)
+        self.deep_mlp.to(self.device)
+        self.wide_linear.to(self.device)
+        if loss_function == "bce":
+            self.loss_fn = torch.nn.BCELoss(reduction="mean")
+        elif loss_function == "mse":
+            self.loss_fn = torch.nn.MSELoss(reduction="mean")
+        self.loss_fn.to(self.device)
+
+        # holds global to local mapping
+
+        # we will insert everything in cache
+        self.cache_idx = {
+            k: torch.ones(idx_vals, dtype=torch.long).to(self.device)
+            for k, idx_vals in enumerate(self.ln_emb)
+        }
+
+        for k in self.cache_idx:
+            self.cache_idx[k][:] = -1
+
+        # sparse drastically speeds it up
+        self.local_cache = nn.EmbeddingBag(
+            cache_size, self.emb_size, mode="sum", sparse=True
+        ).to(device)
+
+        # NOTE: I am deciding to keep these mapping on CPU.
+        # TODO: Verify the tradeoffs here
+
+        self.local_to_global_mapping = torch.ones((cache_size, 2), dtype=torch.long)
+        self.local_to_global_mapping[:] = torch.tensor([-1, -1])
+        # -1 represents empty
+        # 1 represent filled
+        with torch.no_grad():
+            self.local_cache_status = torch.ones(cache_size, dtype=torch.int32)
+            self.local_cache_status[:] = -1
+
+        self.local_cache_ttl = torch.ones(cache_size, dtype=torch.long)
+        self.local_cache_ttl[:] = -1
+
+        self.train_queue = queue.Queue()
+        self.prefetch_queue = queue.PriorityQueue()
+        self.prefetch_futures_queue = queue.Queue()
+        self.prefetch_queue_ttl = queue.Queue()
+        self.original_idx_puts = queue.Queue()
+        self.delete_element_queue = queue.Queue()
+
+        self.prefetch_completed_signal = queue.Queue()
+        self.prefetch_reorder_buffer = dict()
+        self.dynamic_lookahead_val = dict()
+        self.prefetch_expected_iter = 0
+
+        self.worker_id = worker_id
+        self.trainer_prefix = trainer_prefix
+        self.worker_name = f"{trainer_prefix}_{training_worker_id}"
+        self.emb_worker = f"{emb_prefix}"
+        self.current_train_epoch = 0
+        assert (
+            cleanup_batch_proportion <= 1
+        ), "Batch proportion should be between 0 and 1, currently greater than 1"
+
+        assert (
+            cleanup_batch_proportion >= 0
+        ), "Batch proportion should be between 0 and 1, currently less than 0"
+
+        self.cleanup_interval = max(
+            1, int(cleanup_batch_proportion * self.lookahead_value)
+        )
+        self.iter_cleaned_up = 0
+        self.eviction_number = 0  # use it to load balance
+
+        self.cache_usage = 0
+        self.max_cache_usage = 0
+
+        # counters
+        self.total_forward_time = 0
+        self.total_backward_time = 0
+        self.waiting_for_prefetch = 0
+        self.cache_sync_time = 0
+        self.total_time = 0
+        self.total_eviction_time = 0
+        self.total_embedding_fetch = 0
+        self.total_cache_swap_time = 0
+        self.prev_btype = "cold"
+        self.write_files = s3_utils.uploadFile("recommendation-data-bagpipe")
+        return None
+
+    def convert_orig_to_local_by_table_id(self, table_id, global_id):
+        """
+        Give a table id and tensor of global ids converts it to local ids
+        """
+        return self.cache_idx[table_id][global_id]
+
+    def convert_orig_to_local_idx(self, orig_idx):
+        """
+        Converts original indexes from original indexes to local cache indexes
+        orig_idx (list(list)): List of list containing original index
+        """
+        local_cache_idxs = list()
+        for table_id, idxs in enumerate(orig_idx):
+            local_cache_idxs.append(self.cache_idx[table_id][idxs])
+        return local_cache_idxs
+
+    def clean_up_caches(self, iter_cleanup, ttl_update_idx, ttl_update_val):
+        """
+        Based on stored TTLs evict from the caches
+        """
+        try:
+
+            print("Clean up cache called {}".format(iter_cleanup))
+            print("Cleanup Interval {}".format(self.cleanup_interval))
+
+            # this is the TTL update code moved from critical path
+
+            # ttl update
+            # NOTE: For no cache TTL update is going to empty
+            for table_id in ttl_update_idx:
+                orig_idx_to_update = ttl_update_idx[table_id]
+                corresponding_local_idx = self.cache_idx[table_id][orig_idx_to_update]
+
+                values_to_update = ttl_update_val[table_id]
+                self.local_cache_ttl[corresponding_local_idx] = values_to_update
+            # if iter_cleanup % self.cleanup_interval == 0 and iter_cleanup != 0:
+
+            # NOTE: Iter cleanup will launch for the first cleanup as well
+
+            evict_time_start = torch.cuda.Event(enable_timing=True)
+            evict_time_stop = torch.cuda.Event(enable_timing=True)
+
+            read_time_start = torch.cuda.Event(enable_timing=True)
+            read_time_stop = torch.cuda.Event(enable_timing=True)
+
+            evict_time_start.record()
+            if iter_cleanup % self.cleanup_interval == 0:
+                # No eviction in this part
+                # if False:
+
+                self.iter_cleaned_up = iter_cleanup
+                self.eviction_number += 1
+                cleanup_time = time.time()
+                local_idx_to_remove = (self.local_cache_ttl <= iter_cleanup) & (
+                    self.local_cache_ttl != -1
+                )
+                # print("Local cache ttl {}".format(self.local_cache_ttl))
+                local_idx_to_remove = local_idx_to_remove.nonzero().squeeze()
+                self.cache_usage -= len(local_idx_to_remove)
+                global_idx_to_remove = self.local_to_global_mapping[local_idx_to_remove]
+                # we get global idx to remove
+                dict_to_update = dict()
+                emb_to_update = dict()
+                # we need to reassamble the embeddings
+                for table_id in range(len(self.ln_emb)):
+                    # for each table ID find the global indexes
+                    relevant_idx_to_table_id = global_idx_to_remove[:, 0] == table_id
+                    relevant_idx_to_table_id = relevant_idx_to_table_id.nonzero()
+
+                    # if relevant_idx_to_table_id.shape[0] != 1:
+                    relevant_idx_to_table_id = relevant_idx_to_table_id.squeeze()
+                    # print("Relevant idx shape {}".format(relevant_idx_to_table_id.shape))
+                    if len(relevant_idx_to_table_id.shape) == 0:
+                        relevant_idx_to_table_id = torch.tensor(
+                            [relevant_idx_to_table_id.item()]
+                        )
+                    global_idx_to_update_table_id = global_idx_to_remove[
+                        relevant_idx_to_table_id
+                    ]
+                    global_idx_to_update_table_id = global_idx_to_update_table_id[:, 1]
+                    # we have indexes to update
+                    dict_to_update[table_id] = global_idx_to_update_table_id
+                    # we need corresponding values
+                    relevant_local_ids = self.convert_orig_to_local_by_table_id(
+                        table_id, global_idx_to_update_table_id
+                    )
+
+                    with torch.no_grad():
+                        # corresponding values
+                        embedding_vals = self.local_cache(
+                            relevant_local_ids,
+                            torch.arange(len(relevant_local_ids), device=self.device),
+                        )
+                        emb_to_update[table_id] = embedding_vals.to("cpu")
+
+                    # cleaning up global to local mapping
+                    self.cache_idx[table_id][global_idx_to_update_table_id] = -1
+                self.local_to_global_mapping[local_idx_to_remove] = torch.tensor(
+                    [-1, -1]
+                )
+                self.local_cache_status[local_idx_to_remove] = -1
+                self.local_cache_ttl[local_idx_to_remove] = -1
+
+                end_cleanup_time = time.time()
+                # print("Time to clean up {}".format(end_cleanup_time - cleanup_time))
+            # no need for this either
+            # if False:
+            if iter_cleanup % self.cleanup_interval == 0:
+                if (
+                    self.eviction_number % self.trainer_world_size
+                    == self.training_worker_id
+                ):
+                    # only send one workers embedding to update
+                    # already synchronized
+                    # print("Iter cleaned up {}".format(iter_cleanup))
+                    print("evicted till {}".format(iter_cleanup))
+                    rpc.rpc_sync(
+                        self.emb_worker,
+                        cache_eviction_update,
+                        args=(
+                            (
+                                dict_to_update,
+                                emb_to_update,
+                            )
+                        ),
+                    )
+                    print("Dict evicted {}".format(dict_to_update))
+            evict_time_stop.record()
+
+            prefetch_prep_time = time.time()
+
+            batched_embedding = list()
+            enter_flag = 0
+
+            while True:
+                is_empty = self.prefetch_queue.empty()
+                # if is_empty:
+                # # keep going until there is an element in prefetch queue
+                # logger.
+                # continue
+                # print("is empty {}".format(is_empty))
+                if not is_empty:
+                    # if prefetech queue is not empty
+                    # print("In first if")
+
+                    # supporting dynamic lookahead
+                    # TODO: Enable this for dynamic lookahead value
+                    # self.lookahead_value = self.dynamic_lookahead_val[
+                    # self.iter_cleaned_up
+                    # ]
+
+                    # NOTE This is condition for prefetch queue using usual queue
+                    # if (
+                    # list(self.prefetch_queue.queue[0].keys())[0]
+                    # < self.iter_cleaned_up - 1 + self.lookahead_value
+                    # ):
+
+                    # NOTE: this is condition for prefetch queue using priority queue
+                    # logger.info(
+                    # "Prefetch queue 1st element{}".format(
+                    # self.prefetch_queue.queue[0][0]
+                    # )
+                    # )
+
+                    # logger.info("Iter cleaned up {}".format(self.iter_cleaned_up))
+                    if (
+                        self.prefetch_queue.queue[0][0]
+                        <= self.iter_cleaned_up + self.lookahead_value
+                    ):
+                        # print("Iter cleaned up {}".format(self.iter_cleaned_up))
+                        enter_flag = 1
+                        # print("Getting prefetch queue")
+                        ttl_val, val = self.prefetch_queue.get(block=True)
+
+                        if ttl_val != self.prefetch_expected_iter:
+                            while ttl_val != self.prefetch_expected_iter:
+                                self.prefetch_queue.put((ttl_val, val))
+                                ttl_val, val = self.prefetch_queue.get(block=True)
+
+                        self.prefetch_expected_iter += 1
+                        # we will need to evict all elements from the cache before prefetching
+
+                        # if val["batch_type"] == "cold":
+                        swap_time_start = torch.cuda.Event(enable_timing=True)
+                        swap_time_stop = torch.cuda.Event(enable_timing=True)
+                        swap_time_start.record()
+                        if self.prev_btype != val["batch_type"]:
+                            # when batch types switch we will sync
+                            self.prev_btype = val["batch_type"]
+                            # update all elements which have been in the training system
+                            local_idx_to_remove = self.local_cache_ttl != -1
+                            local_idx_to_remove = (
+                                local_idx_to_remove.nonzero().squeeze()
+                            )
+                            self.cache_usage -= len(local_idx_to_remove)
+                            global_idx_to_remove = self.local_to_global_mapping[
+                                local_idx_to_remove
+                            ]
+                            # we get global idx to remove
+                            dict_to_update = dict()
+                            emb_to_update = dict()
+                            # we need to reassamble the embeddings
+                            for table_id in range(len(self.ln_emb)):
+                                # for each table ID find the global indexes
+                                relevant_idx_to_table_id = (
+                                    global_idx_to_remove[:, 0] == table_id
+                                )
+                                relevant_idx_to_table_id = (
+                                    relevant_idx_to_table_id.nonzero()
+                                )
+
+                                # if relevant_idx_to_table_id.shape[0] != 1:
+                                relevant_idx_to_table_id = (
+                                    relevant_idx_to_table_id.squeeze()
+                                )
+                                # print("Relevant idx shape {}".format(relevant_idx_to_table_id.shape))
+                                if len(relevant_idx_to_table_id.shape) == 0:
+                                    relevant_idx_to_table_id = torch.tensor(
+                                        [relevant_idx_to_table_id.item()]
+                                    )
+                                global_idx_to_update_table_id = global_idx_to_remove[
+                                    relevant_idx_to_table_id
+                                ]
+                                global_idx_to_update_table_id = (
+                                    global_idx_to_update_table_id[:, 1]
+                                )
+                                # we have indexes to update
+                                dict_to_update[table_id] = global_idx_to_update_table_id
+                                # we need corresponding values
+                                relevant_local_ids = (
+                                    self.convert_orig_to_local_by_table_id(
+                                        table_id, global_idx_to_update_table_id
+                                    )
+                                )
+
+                                with torch.no_grad():
+                                    # corresponding values
+                                    embedding_vals = self.local_cache(
+                                        relevant_local_ids,
+                                        torch.arange(
+                                            len(relevant_local_ids), device=self.device
+                                        ),
+                                    )
+                                    emb_to_update[table_id] = embedding_vals.to("cpu")
+                                rpc.rpc_sync(
+                                    self.emb_worker,
+                                    cache_eviction_update,
+                                    args=(
+                                        (
+                                            dict_to_update,
+                                            emb_to_update,
+                                        )
+                                    ),
+                                )
+                        swap_time_stop.record()
+                        torch.cuda.synchronize()
+                        self.total_cache_swap_time += swap_time_start.elapsed_time(
+                            swap_time_stop
+                        )
+                        # print("Got from the queue")
+                        batched_embedding.append(val)
+                        # we are getting ttl val anyways
+                        ttl_val = list(val.keys())[0]
+                        # TODO: Enable for dynamic
+                        # self.dynamic_lookahead_val[ttl_val] = val["lookahead_value"]
+                        # print("Launched prefetch {}".format(ttl_val))
+                        self.original_idx_puts.put(val)
+                        self.prefetch_queue_ttl.put(ttl_val)
+                    else:
+                        if enter_flag == 1:
+                            # print("Making a prefetch req")
+                            fut = rpc.rpc_async(
+                                self.emb_worker,
+                                get_embedding,
+                                args=(batched_embedding,),
+                            )
+                            self.prefetch_futures_queue.put(fut)
+                            enter_flag = 0
+
+                        break
+
+                        # print("Launched prefetch {}".format(ttl_val))
+                else:
+                    if enter_flag == 1:
+                        fut = rpc.rpc_async(
+                            self.emb_worker,
+                            get_embedding,
+                            args=(batched_embedding,),
+                        )
+
+                        self.prefetch_futures_queue.put(fut)
+                        enter_flag = 0
+                        # print("Launched prefetch {}".format(ttl_val))
+                        # print("Second else")
+                        # print("prefetch queue {}".format(self.prefetch_queue))
+                        break
+
+                    if enter_flag == 0:
+                        # keep checking prefetch queue
+                        continue
+            end_prefetch_pre_time = time.time()
+            # print(
+            # "Prefetch prep time {}".format(
+            # end_prefetch_pre_time - prefetch_prep_time
+            # )
+            # )
+
+            read_time_start.record()
+            print("Out of prefetch prep loop")
+            # adding to the cache post eviction
+            while True:
+                if not self.prefetch_queue_ttl.empty():
+                    prefetch_add_time = time.time()
+
+                    fut = self.prefetch_futures_queue.get(block=True)
+                    time_spent_waiting = time.time()
+                    # fetched_batch = fut
+                    fetched_batch = fut.wait()
+                    # print(
+                    # "Time spend waiting on future {}".format(
+                    # time.time() - time_spent_waiting
+                    # )
+
+                    # )
+                    # print("Fetched iter {}".format(ttl_val))
+
+                    empty_location = self.local_cache_status == -1
+                    empty_location = empty_location.nonzero().squeeze()
+
+                    if self.cache_usage > self.max_cache_usage:
+                        self.max_cache_usage = self.cache_usage
+                    # logger.info("Cache Size Remaining {}".format(len(empty_location)))
+                    logger.info("Cache Size used {}".format(self.cache_usage))
+                    last_use_location = 0
+                    # assert (
+                    # len(empty_location) >= emb_vals_length
+                    # ), "Not enought Cache Available"
+
+                    # cuda_start_movement = torch.cuda.Event(enable_timing=True)
+                    # cuda_stop_movement = torch.cuda.Event(enable_timing=True)
+                    for fetched_vals in fetched_batch:
+                        ttl_val = self.prefetch_queue_ttl.get(block=True)
+                        # print("Fetched itr {}".format(ttl_val))
+                        # print("Evicted till {}".format(self.iter_cleaned_up))
+                        val = self.original_idx_puts.get(block=True)
+                        total_time_movement_per_batch = 0
+                        for table_id, emb_vals in enumerate(fetched_vals):
+                            if len(emb_vals) > 0:
+                                emb_vals_length = len(emb_vals)
+                                with torch.cuda.stream(s):
+                                    # cuda_start_movement.record()
+                                    emb_vals = emb_vals.to(self.device)
+                                    indexing_offset = torch.arange(
+                                        emb_vals_length, device=self.device
+                                    )
+                                # cuda_stop_movement.record()
+
+                                original_idx = val[ttl_val][table_id]
+
+                                empty_location_to_use = empty_location[
+                                    last_use_location : last_use_location
+                                    + emb_vals_length
+                                ]
+                                # changing indexing avoid running lookups agains and again
+                                last_use_location += emb_vals_length
+                                self.cache_usage += emb_vals_length
+                                self.local_cache_status[empty_location_to_use] = 1
+                                empty_location_to_use_device = empty_location_to_use.to(
+                                    self.device
+                                )
+
+                                self.local_to_global_mapping[
+                                    empty_location_to_use, 0
+                                ] = table_id
+
+                                self.local_to_global_mapping[
+                                    empty_location_to_use, 1
+                                ] = original_idx
+
+                                self.cache_idx[table_id][
+                                    original_idx
+                                ] = empty_location_to_use_device
+
+                                self.local_cache_ttl[empty_location_to_use] = ttl_val
+
+                                # torch.cuda.synchronize()
+                                # total_time_movement_per_batch += (
+                                # cuda_start_movement.elapsed_time(cuda_stop_movement)
+                                # )
+
+                                torch.cuda.current_stream().wait_stream(s)
+                                with torch.no_grad():
+                                    self.local_cache(
+                                        empty_location_to_use_device,
+                                        indexing_offset,
+                                    ).data = emb_vals
+                        self.prefetch_completed_signal.put(ttl_val)
+
+                else:
+                    # no elements in the queue
+                    break
+            read_time_stop.record()
+
+            torch.cuda.synchronize()
+            eviction_time = evict_time_start.elapsed_time(evict_time_stop)
+            self.total_eviction_time += eviction_time
+            read_time = read_time_start.elapsed_time(read_time_stop)
+            self.total_embedding_fetch += read_time
+            logger.info("Eviction Time {}".format(eviction_time))
+            logger.info("Read time {}".format(read_time))
+
+        except Exception as e:
+            sys.exit(e.__str__())
+            logger.error(e)
+            print(e)
+
+    # def create_mlp(self, ln, sigmoid_layer):
+    #     layers = nn.ModuleList()
+    #     for i in range(0, ln.size - 1):
+    #         n = ln[i]
+    #         m = ln[i + 1]
+    #         LL = nn.Linear(int(n), int(m), bias=True)
+    #         # some xavier stuff the original pytorch code was doing
+    #         mean = 0.0
+    #         std_dev = np.sqrt(2 / (m + n))
+    #         W = np.random.normal(mean, std_dev, size=(m, n)).astype(np.float32)
+    #         std_dev = np.sqrt(1 / m)
+    #         bt = np.random.normal(mean, std_dev, size=m).astype(np.float32)
+    #         LL.weight.data = torch.tensor(W, requires_grad=True)
+    #         LL.bias.data = torch.tensor(bt, requires_grad=True)
+    #         layers.append(LL)
+    #         if i == sigmoid_layer:
+    #             layers.append(nn.Sigmoid())
+    #         else:
+    #             layers.append(nn.ReLU())
+    #     return torch.nn.Sequential(*layers)
+    def create_deep_mlp(self, ln):
+        layers = nn.ModuleList()
+        for i in range(0, len(ln) - 1):
+            n = ln[i]
+            m = ln[i + 1]
+            LL = nn.Linear(int(n), int(m), bias=True)
+            # some xavier stuff the original pytorch code was doing
+
+            # TODO: Change the parameter initializaion?
+            mean = 0.0
+            std_dev = np.sqrt(2 / (m + n))
+            W = np.random.normal(mean, std_dev, size=(m, n)).astype(np.float32)
+            std_dev = np.sqrt(1 / m)
+            bt = np.random.normal(mean, std_dev, size=m).astype(np.float32)
+            LL.weight.data = torch.tensor(W, requires_grad=True)
+            LL.bias.data = torch.tensor(bt, requires_grad=True)
+
+            layers.append(LL)
+
+            # add ReLU for all linear layer except the last one
+            if i != len(ln) - 2:
+                layers.append(nn.ReLU())
+        return torch.nn.Sequential(*layers)
+
+    def create_wide(self, ln, cross_transform=False):
+        if cross_transform == False:
+            n = ln[-1] + 26 * self.emb_size
+            m = 1
+            LL = nn.Linear(int(n), int(m), bias=True)
+            # some xavier stuff the original pytorch code was doing
+
+            # TODO: Change the parameter initializaion?
+            mean = 0.0
+            std_dev = np.sqrt(2 / (m + n))
+            W = np.random.normal(mean, std_dev, size=(m, n)).astype(np.float32)
+            std_dev = np.sqrt(1 / m)
+            bt = np.random.normal(mean, std_dev, size=m).astype(np.float32)
+            LL.weight.data = torch.tensor(W, requires_grad=True)
+            LL.bias.data = torch.tensor(bt, requires_grad=True)
+            return LL
+        return None
+
+    def apply_mlp(self, dense_x, mlp_network):
+        """
+        Apply MLP on the features
+        """
+        return mlp_network(dense_x)
+
+    def sync_id(self):
+        # sync_embeddings = list()
+        with torch.no_grad():
+            # TODO: verify that this actually works in place
+            dist.all_reduce(self.local_cache.weight.grad)
+
+    def apply_emb(self, lS_i):
+        """
+        Fetch embedding
+        """
+        fetched_embeddings = list()
+        for table_id, emb_id in enumerate(lS_i):
+            # find the corresponding id to fetch
+            local_cache_id = self.cache_idx[table_id][emb_id]
+            # NOTE: Commented checking code
+            # local_cache_invalid = local_cache_id == -1
+            # local_cache_invalid = local_cache_invalid.nonzero().squeeze()
+            # print(local_cache_invalid)
+            # if len(local_cache_invalid.shape) == 0:
+            # local_cache_invalid = torch.tensor([local_cache_invalid.item()])
+
+            # if len(local_cache_invalid) != 0:
+            # print("Table {} Emb {}".format(table_id, emb_id[local_cache_invalid]))
+            # sys.exit("Invalid cache indexed")
+            # print("local cache id device {}".format(local_cache_id.device))
+            embs = self.local_cache(
+                local_cache_id,
+                torch.arange(len(local_cache_id)).to(self.device),
+            )
+            fetched_embeddings.append(embs)
+        return fetched_embeddings
+
+    # def forward(self, dense_x, lS_i, target):
+    # """
+    # Forward pass of the training
+    # """
+    # ly = self.apply_emb(lS_i)
+
+    # ly.append(dense_x)
+    # flat_tensor = torch.cat(ly, dim = 1)
+    # print(flat_tensor.size())
+    # x = self.apply_mlp(flat_tensor, self.deep_mlp)
+    # y = self.wide_linear(dense_x)
+
+    # z = torch.add(x, y)
+    # sigmoid = torch.nn.Sigmoid()
+    # p = sigmoid(z)
+    # loss = self.loss_fn(p, target)
+
+    # return loss
+    def forward(self, dense_x, lS_i, target):
+        """
+        Forward pass of the training
+        """
+        ly = self.apply_emb(lS_i)
+        x = self.apply_mlp(dense_x, self.deep_mlp)
+
+        flat_tensor = (
+            torch.cat(ly, dim=1).transpose(0, 1).reshape((-1, 26 * self.emb_size))
+        )
+
+        comb = torch.cat([flat_tensor, x], dim=1)
+
+        y = self.wide_linear(comb)
+
+        sigmoid = torch.nn.Sigmoid()
+        p = sigmoid(y)
+        loss = self.loss_fn(p, target)
+        return loss
+
+
+def update_train_queue(input_dict):
+    # print("Train queue status {}".format(input_dict))
+    comp_intensive_model.train_queue.put(input_dict)
+    return 1
+
+
+s = torch.cuda.Stream()
+
+
+def fill_prefetch_cache():
+    num_times_run = 0
+    try:
+        while num_times_run < comp_intensive_model.lookahead_value:
+            prefetch_time_start = time.time()
+            ttl_val, val = comp_intensive_model.prefetch_queue.get(block=True)
+            # ttl_val = list(val.keys())[0]
+
+            if ttl_val != comp_intensive_model.prefetch_expected_iter:
+                while ttl_val != comp_intensive_model.prefetch_expected_iter:
+                    # wrong fetch putting it back
+                    comp_intensive_model.prefetch_queue.put((ttl_val, val))
+                    # Hopefully by now we will have gotten what we needed
+                    ttl_val, val = comp_intensive_model.prefetch_queue.get(block=True)
+                    # ttl_val = list(val.keys())[0]
+
+            fut = rpc.rpc_async(
+                comp_intensive_model.emb_worker, get_embedding_single, args=(val,)
+            )
+            comp_intensive_model.prefetch_expected_iter += 1
+            # NOTE:Enable for dynamic look ahead
+            # comp_intensive_model.dynamic_lookahead_val[ttl_val] = val["lookahead_value"]
+            comp_intensive_model.prefetch_futures_queue.put(fut)
+            comp_intensive_model.prefetch_queue_ttl.put(ttl_val)
+            # keep getting prefetch queue
+            fut = comp_intensive_model.prefetch_futures_queue.get(block=True)
+            ttl_val = comp_intensive_model.prefetch_queue_ttl.get(block=True)
+            fetched_vals = fut.wait()
+            # print("Fetched vals {}".format(fetched_vals))
+            total_time_movement_per_batch = 0
+
+            # cuda_start_movement = torch.cuda.Event(enable_timing=True)
+            # cuda_stop_movement = torch.cuda.Event(enable_timing=True)
+
+            empty_location = comp_intensive_model.local_cache_status == -1
+            empty_location = empty_location.nonzero().squeeze()
+            last_use_location = 0
+            # logger.info("Cache Size Remaining {}".format(len(empty_location)))
+            # logger.info("Cache Size used {}".format(comp_intensive_model.cache_usage))
+            # logger.info(
+            # "Sum of free and empty {}".format(
+            # len(empty_location) + comp_intensive_model.cache_usage
+            # )
+            # )
+            for table_id, emb_vals in enumerate(fetched_vals):
+                # find the original idx
+                if len(emb_vals) > 0:
+
+                    # cuda_start_movement.record()
+
+                    emb_vals_length = len(emb_vals)
+
+                    # cuda_start_movement.record()
+                    with torch.cuda.stream(s):
+                        emb_vals = emb_vals.to(
+                            comp_intensive_model.device,
+                        )
+                        indexing_offset = torch.arange(
+                            emb_vals_length, device=comp_intensive_model.device
+                        )
+                    # cuda_stop_movement.record()
+
+                    # torch.cuda.synchronize()
+                    # total_time_movement_per_batch += cuda_start_movement.elapsed_time(
+                    # cuda_stop_movement
+                    # )
+                    original_idx = val[ttl_val][table_id]
+                    # find empty locations in the local cache
+                    # print("Empty Location {}".format(empty_location))
+                    # assert (
+                    # len(empty_location) >= emb_vals_length
+                    # ), "Not enough Cache Avaialable"
+                    empty_location_to_use = empty_location[
+                        last_use_location : last_use_location + emb_vals_length
+                    ]
+
+                    last_use_location += emb_vals_length
+                    comp_intensive_model.cache_usage += emb_vals_length
+                    # logger.info("Empty locations {}".format(empty_location_to_use))
+                    empty_location_to_use_device = empty_location_to_use.to(
+                        comp_intensive_model.device
+                    )
+                    # updating cache structure before access
+                    comp_intensive_model.local_cache_status[empty_location_to_use] = 1
+                    # we copy values to the embedding table
+
+                    # update local to global
+
+                    # this inserts the table id -1
+                    # print("Table ID {}".format(table_id))
+                    comp_intensive_model.local_to_global_mapping[
+                        empty_location_to_use, 0
+                    ] = table_id
+
+                    # this inserts the  emb id
+                    comp_intensive_model.local_to_global_mapping[
+                        empty_location_to_use, 1
+                    ] = original_idx
+                    comp_intensive_model.cache_idx[table_id][
+                        original_idx
+                    ] = empty_location_to_use_device
+
+                    comp_intensive_model.local_cache_ttl[
+                        empty_location_to_use
+                    ] = ttl_val
+
+                    torch.cuda.current_stream().wait_stream(s)
+                    with torch.no_grad():
+                        comp_intensive_model.local_cache(
+                            empty_location_to_use_device, indexing_offset
+                        ).data = emb_vals
+
+            # logger.info(
+            # "Total time data movement(ms) {}".format(total_time_movement_per_batch)
+            # )
+            # prefetch_time_end = time.time()
+            # logger.info(
+            # "Fill prefetch move time(ms) {}".format(
+            # (prefetch_time_end - prefetch_time_start) * 1000
+            # )
+            # )
+            comp_intensive_model.prefetch_completed_signal.put(ttl_val)
+
+            num_times_run += 1
+    except queue.Empty:
+        pass
+
+
+def update_prefetch_queue(input_dict):
+
+    input_iter = list(input_dict.keys())[0]
+    comp_intensive_model.prefetch_queue.put((input_iter, input_dict), block=True)
+    return 1
+
+
+def load_hot_elements_cache(stop_iter):
+    hot_embedding = np.load(args.hot_emb_file, allow_pickle=True)
+    hot_embedding = hot_embedding["arr_0"]
+    hot_embedding = hot_embedding.tolist()
+
+    empty_location = comp_intensive_model.local_cache_status == -1
+    empty_location = empty_location.nonzero().squeeze()
+    last_use_location = 0
+
+    # fetching embedding values
+
+    dict_to_send_emb_server = dict()
+    list_to_fetch = list()
+    for table_id, emb_idx in enumerate(hot_embedding):
+        embs_access = np.array(list(emb_idx.keys()))
+        embs_access = embs_access[:, 1].tolist()
+        vals_to_fetch = torch.tensor(embs_access)
+        if len(vals_to_fetch) > 0:
+            list_to_fetch.append(vals_to_fetch)
+        else:
+            list_to_fetch.append(torch.tensor([]))
+
+    dict_to_send_emb_server[1] = list_to_fetch
+
+    fetched_vals = rpc.rpc_sync(
+        comp_intensive_model.emb_worker,
+        get_embedding_single,
+        args=(dict_to_send_emb_server,),
+    )
+    print("List to fetch {}".format(list_to_fetch[0]))
+
+    print("Length Fetched Val {}".format(len(fetched_vals)))
+
+    for table_id, emb_vals in enumerate(fetched_vals):
+        # find the original idx
+        if len(emb_vals) > 0:
+            emb_vals_length = len(emb_vals)
+            # print("emb vals length {}".format(emb_vals_length))
+            emb_vals = emb_vals.to(comp_intensive_model.device)
+            indexing_offset = torch.arange(
+                emb_vals_length, device=comp_intensive_model.device
+            )
+
+            original_idx = list_to_fetch[table_id]
+            empty_location_to_use = empty_location[
+                last_use_location : last_use_location + emb_vals_length
+            ]
+            print("Last use location {}".format(last_use_location))
+            last_use_location += emb_vals_length
+            comp_intensive_model.cache_usage += emb_vals_length
+
+            empty_location_to_use_device = empty_location_to_use.to(
+                comp_intensive_model.device
+            )
+
+            comp_intensive_model.local_cache_status[empty_location_to_use] = 1
+
+            comp_intensive_model.local_to_global_mapping[
+                empty_location_to_use, 0
+            ] = table_id
+
+            comp_intensive_model.local_to_global_mapping[
+                empty_location_to_use, 1
+            ] = original_idx
+            print("Original idx {}".format(original_idx))
+            print(
+                "Length cache idx {}".format(
+                    len(comp_intensive_model.cache_idx[table_id])
+                )
+            )
+            comp_intensive_model.cache_idx[table_id][
+                original_idx
+            ] = empty_location_to_use_device
+
+            comp_intensive_model.local_cache_ttl[empty_location_to_use] = stop_iter + 1
+
+            with torch.no_grad():
+                comp_intensive_model.local_cache(
+                    empty_location_to_use_device, indexing_offset
+                ).data = emb_vals
+
+
+def launch_cache_cleanup():
+    """
+    Launch cache cleanup
+    """
+    # print("Cache cleanup launched")
+    while True:
+        try:
+            (
+                iter_to_cleanup,
+                ttl_update_idx,
+                ttl_update_val,
+            ) = comp_intensive_model.delete_element_queue.get(block=True)
+            # print("Iter to cleanup {}".format(iter_to_cleanup))
+            # print("iter to cleanup {}".format(iter_to_cleanup))
+            comp_intensive_model.clean_up_caches(
+                iter_to_cleanup, ttl_update_idx, ttl_update_val
+            )
+        except queue.Empty:
+            pass
+
+
+def launch_cache_cleanup_no_thread():
+    """
+    Launch cache cleanup
+    """
+    # print("Cache cleanup launched")
+    # while True:
+    (
+        iter_to_cleanup,
+        ttl_update_idx,
+        ttl_update_val,
+    ) = comp_intensive_model.delete_element_queue.get(block=True)
+    # print("iter to cleanup {}".format(iter_to_cleanup))
+    comp_intensive_model.clean_up_caches(
+        iter_to_cleanup, ttl_update_idx, ttl_update_val
+    )
+
+
+def exit_worker(input_dict):
+    rpc.shutdown()
+    return 1
+
+
+def cache_eviction_update(dict_to_update, emb_to_update):
+    # This is dummy function real one is in embedding server
+    """
+    update_dict- key - (table_id, emb_id): tensor to store
+    """
+    emb_grouped_by_table_id = defaultdict(list)
+    emb_id_grouped_by_table_id = defaultdict(list)
+
+    for key in update_dict:
+        table_id, emb_id = key
+        emb_grouped_by_table_id[table_id].append(update_dict[key])
+        emb_id_grouped_by_table_id[table_id].append(emb_id)
+
+    for key in emb_grouped_by_table_id:
+        grouped_by_table_id[key] = torch.tensor(emb_grouped_by_table_id[key])
+        emb_id_grouped_by_table_id[key] = torch.tensor(emb_id_grouped_by_table_id[key])
+    embedding_object.update_embeddings(
+        emb_grouped_by_table_id, emb_id_grouped_by_table_id
+    )
+    return 1
+
+
+def get_embedding(input_list):
+    # This is dummy function real one is in embedding server
+    """
+    These are prefetch embeddings
+    Args:
+        input_list (list(tuples)): List of tuples, tuples(table_id, emb_id)
+    """
+    emb_decompressed = defaultdict(list)
+    for table_id, emb_id in emb_decompressed:
+        emb_decompressed[table_id].append(emb_id)
+
+    fetched_embeddings = embedding_object.get_embeddings(emb_decompressed)
+    return fetched_embeddings
+
+
+def get_embedding_single(input_list):
+    # This is dummy function real one is in embedding server
+    """
+    These are prefetch embeddings
+    Args:
+        input_list (list(tuples)): List of tuples, tuples(table_id, emb_id)
+    """
+    emb_decompressed = defaultdict(list)
+    for table_id, emb_id in emb_decompressed:
+        emb_decompressed[table_id].append(emb_id)
+
+    fetched_embeddings = embedding_object.get_embeddings(emb_decompressed)
+    return fetched_embeddings
+
+
+def main(args):
+    expected_iter = 0
+    iter_overflow = dict()
+    os.environ["MASTER_ADDR"] = args.master_ip
+    os.environ["MASTER_PORT"] = args.master_port
+    arch_mlp_deep_adjusted = (
+        str(args.emb_size * len(args.ln_emb) + args.dense_size)
+        + "-"
+        + args.arch_mlp_deep
+    )
+    ln_deep = np.fromstring(arch_mlp_deep_adjusted, dtype=int, sep="-")
+    len_wide = ln_deep
+
+    # loaded hot embs
+
+    global comp_intensive_model
+    comp_intensive_model = DistTrainModel(
+        emb_size=args.emb_size,
+        ln_deep=ln_deep,
+        ln_wide=len_wide,
+        # sigmoid_bot=-1,
+        # sigmoid_top=ln_top.size - 2,
+        loss_function=args.loss_function,
+        feature_interaction=args.arch_interaction_op,
+        worker_id=args.worker_id,
+        lookahead_value=args.lookahead_value,
+        cache_size=args.cache_size,
+        ln_emb=args.ln_emb,
+        mini_batch_size=args.mini_batch_size,
+        training_worker_id=args.dist_worker_id,
+        device=args.device,
+        emb_prefix=args.emb_prefix,
+        trainer_prefix=args.trainer_prefix,
+        trainer_world_size=args.world_size_trainers,
+        cleanup_batch_proportion=args.cleanup_batch_proportion,
+    )
+
+    # rpc fuctions
+
+    # rpc setup
+    rpc.init_rpc(
+        comp_intensive_model.worker_name,
+        rank=args.worker_id,
+        world_size=args.world_size,
+    )
+    print("Rpc init")
+    dist.init_process_group(
+        backend=args.dist_backend,
+        init_method=f"tcp://{args.dist_master_ip}:{args.master_port_ccom}",
+        world_size=args.world_size_trainers,
+        rank=args.dist_worker_id,
+    )
+
+    comp_intensive_model.wide_linear = DDP(
+        comp_intensive_model.wide_linear, device_ids=[0]
+    )
+    comp_intensive_model.deep_mlp = DDP(comp_intensive_model.deep_mlp, device_ids=[0])
+
+    # thread for waiting on prefetching
+
+    # prefetch_update_thread = threading.Thread(target=update_prefetch_cache)
+    # prefetch_update_thread.start()
+
+    # cleanup_and_update_thread = threading.Thread(target=launch_cache_cleanup)
+    # cleanup_and_update_thread.start()
+
+    optimizer = optim.SGD(
+        [
+            {
+                "params": comp_intensive_model.local_cache.parameters(),
+                "lr": 0.01,
+            },
+            {
+                "params": comp_intensive_model.wide_linear.parameters(),
+                "lr": 0.01,
+            },
+            {
+                "params": comp_intensive_model.deep_mlp.parameters(),
+                "lr": 0.01,
+            },
+        ]
+    )
+
+    # train loop
+
+    # this will fill the prefetch cache
+
+    # this is the handle we use for storing all reduce future
+    # NOTE: No need to prefetch
+
+    # prefetch cache will fetch first element
+
+    load_hot_elements_cache(args.stop_iter)
+    fill_prefetch_cache()
+
+    forward_start = torch.cuda.Event(enable_timing=True)
+    forward_stop = torch.cuda.Event(enable_timing=True)
+    backward_start = torch.cuda.Event(enable_timing=True)
+    backward_stop = torch.cuda.Event(enable_timing=True)
+    sync_time = torch.cuda.Event(enable_timing=True)
+    sync_time_stop = torch.cuda.Event(enable_timing=True)
+    while True:
+        total_start = time.time()
+        try:
+            queue_fetch_time = time.time()
+            # get train example
+            train_example = comp_intensive_model.train_queue.get(block=True)
+            queue_fetch_end = time.time()
+            print("Queue Fetch Time {}".format(queue_fetch_end - queue_fetch_time))
+            current_epoch = list(train_example.keys())[0]
+            # handling rpc potential reordering
+            if current_epoch != expected_iter:
+                # move current train example to the dictionary
+                iter_overflow[current_epoch] = copy.deepcopy(train_example)
+                # check if we have the expected iter in the overflow
+                if expected_iter in iter_overflow:
+                    train_example = iter_overflow.pop(expected_iter)
+                    current_epoch = list(train_example.keys())[0]
+                    expected_iter += 1
+                else:
+                    # pop more and see if we find what we want
+                    continue
+            else:
+                expected_iter += 1
+            if current_epoch == args.stop_iter:
+                # s3 out code
+                logger.info("Total Time {}".format(comp_intensive_model.total_time))
+                logger.info(
+                    "Total Time forward {}".format(
+                        comp_intensive_model.total_forward_time
+                    )
+                )
+
+                logger.info(
+                    "Total Time backward {}".format(
+                        comp_intensive_model.total_backward_time
+                    )
+                )
+
+                logger.info(
+                    "Total Time prefetch {}".format(
+                        comp_intensive_model.waiting_for_prefetch
+                    )
+                )
+
+                logger.info(
+                    "Total time eviction {}".format(
+                        comp_intensive_model.total_eviction_time
+                    )
+                )
+
+                logger.info(
+                    "Total time embedding fetch {}".format(
+                        comp_intensive_model.total_embedding_fetch
+                    )
+                )
+
+                logger.info(
+                    "Total Time cache sync {}".format(
+                        comp_intensive_model.cache_sync_time
+                    )
+                )
+
+                logger.info(
+                    "Total Time cache swap {}".format(
+                        comp_intensive_model.total_cache_swap_time
+                    )
+                )
+                file_name = (
+                    f"training_worker_{args.dist_worker_id}_{args.logging_prefix}.log"
+                )
+
+                comp_intensive_model.write_files.push_file(
+                    file_name,
+                    f"{comp_intensive_model.trainer_world_size}_trainers_new_wd/{file_name}",
+                )
+                call("pkill -9 python", shell=True)
+
+            # logger.info(f"Current Iter {current_epoch}")
+            print(f"Current Iter {current_epoch}")
+            checked_iter = time.time()
+            check_iter_prefetch = comp_intensive_model.prefetch_completed_signal.get(
+                block=True
+            )
+            checked_iter_time = time.time()
+            comp_intensive_model.waiting_for_prefetch += (
+                checked_iter_time - checked_iter
+            ) * 1000
+            # logger.info(
+            # "Checked time(ms) {}".format((checked_iter_time - checked_iter) * 1000)
+            # )
+            print(f"Checked Iter {check_iter_prefetch}")
+            logger.info("Iter {}".format(check_iter_prefetch))
+            comp_intensive_model.current_train_epoch = current_epoch
+
+            forward_start.record()
+            loss = comp_intensive_model.forward(
+                train_example[current_epoch]["train_data"]["dense_x"].to(
+                    comp_intensive_model.device
+                ),
+                train_example[current_epoch]["train_data"]["sparse_vector"],
+                train_example[current_epoch]["train_data"]["target"].to(
+                    comp_intensive_model.device
+                ),
+            )
+            forward_stop.record()
+
+            backward_start.record()
+            loss.backward()
+            backward_stop.record()
+
+            # backward_stop = time.time()
+            # print("Time for backward {}".format(backward_stop - backward_start))
+
+            sync_time.record()
+            comp_intensive_model.sync_id()
+            sync_time_stop.record()
+
+            # optim_time = time.time()
+            optimizer.step()
+            optimizer.zero_grad()
+            # optim_time_end = time.time()
+            # print("Optim Time end to end {}".format(optim_time_end - optim_time))
+
+            # decide which elemenst are going to live longer
+            # elements_to_cache = train_example[current_epoch]["cache_elements"]
+            # data_move = time.time()
+
+            # ttl_update_time = torch.cuda.Event(enable_timing=True)
+            # ttl_update_time_end = torch.cuda.Event(enable_timing=True)
+
+            # ttl_update_time.record()
+            ttl_update_idx = train_example[current_epoch]["ttl_idx"]
+            ttl_update_val = train_example[current_epoch]["ttl_val"]
+
+            comp_intensive_model.delete_element_queue.put(
+                (current_epoch, ttl_update_idx, ttl_update_val)
+            )
+
+            # data_move_end = time.time()
+            # print("Data move end {}".format(data_move_end - data_move))
+            launch_cache_cleanup_no_thread()
+            # del loss
+            torch.cuda.synchronize()
+            logger.info(
+                "Forward time(ms) {}".format(forward_start.elapsed_time(forward_stop))
+            )
+
+            comp_intensive_model.total_forward_time += forward_start.elapsed_time(
+                forward_stop
+            )
+
+            logger.info(
+                "Backward time(ms) {}".format(
+                    backward_start.elapsed_time(backward_stop)
+                )
+            )
+
+            comp_intensive_model.total_backward_time += backward_start.elapsed_time(
+                backward_stop
+            )
+            logger.info(
+                "Time for cache sync(ms) {}".format(
+                    sync_time.elapsed_time(sync_time_stop)
+                )
+            )
+            comp_intensive_model.cache_sync_time += sync_time.elapsed_time(
+                sync_time_stop
+            )
+            total_end = time.time()
+            logger.info(
+                "Total end to end time(ms) {}".format((total_end - total_start) * 1000)
+            )
+
+            comp_intensive_model.total_time += (total_end - total_start) * 1000
+
+        except queue.Empty:
+            pass
+
+
+def get_emb_length(in_file):
+    with open(in_file, "r") as fin:
+        data = fin.readlines()
+
+    data = [int(d) for d in data]
+    return data
+
+
+def parse_args(parser):
+    parser.add_argument(
+        "--arch-mlp-deep",
+        type=utils.dash_separated_ints,
+        help="dimensions of the deep part",
+    )
+    parser.add_argument(
+        "--len-wide",
+        type=int,
+        default=13,
+        help="dimensions of the deep part",
+    )
+
+    parser.add_argument(
+        "--emb-size",
+        type=int,
+        default=48,
+        help="size of the embedding for each sparse feature",
+    )
+
+    parser.add_argument(
+        "--arch-interaction-op", type=str, choices=["dot", "cat"], default="dot"
+    )
+
+    parser.add_argument(
+        "--lookahead-value",
+        type=int,
+        default=200,
+        help="The number of batches further to look ahead for getting cache",
+    )
+
+    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--arch-interaction-itself", action="store_true", default=False)
+    parser.add_argument("--loss-function", choices=["mse", "bce"], default="bce")
+    parser.add_argument(
+        "--ln-emb",
+        type=utils.dash_separated_ints,
+        help="embedding table sizes in the right order",
+        default=[
+            1460,
+            583,
+            10131227,
+            2202608,
+            305,
+            24,
+            12517,
+            633,
+            3,
+            93145,
+            5683,
+            8351593,
+            3194,
+            27,
+            14992,
+            5461306,
+            10,
+            5652,
+            2173,
+            4,
+            7046547,
+            18,
+            15,
+            286181,
+            105,
+            142572,
+        ],
+    )
+    parser.add_argument(
+        "--mini-batch-size", type=int, default=16384, help="The batch size to train"
+    )
+    parser.add_argument(
+        "--dense-size", type=int, default=13, help="The number of dense parameter"
+    )
+    parser.add_argument("--cache-size", type=int, required=True)
+    parser.add_argument(
+        "--worker-id",
+        type=int,
+        required=True,
+        help="Global worker ID, i.e., rank for RPC init",
+    )
+    parser.add_argument(
+        "--world-size", type=int, required=True, help="Global world size"
+    )
+    parser.add_argument("--master-ip", type=str, default="localhost")
+    parser.add_argument("--master-port", type=str, default="18000")
+    parser.add_argument(
+        "--master-port-ccom",
+        type=int,
+        default=9988,
+        help="Port for collective communication",
+    )
+    parser.add_argument("--dist-backend", type=str, default="gloo")
+
+    parser.add_argument(
+        "--dist-master-ip", type=str, required=True, help="IP of rank 0 training worker"
+    )
+    parser.add_argument(
+        "--dist-worker-id",
+        type=int,
+        required=True,
+        help="Distributed Worker ID, for collective collection library",
+    )
+    parser.add_argument(
+        # "--dist-world-size",
+        "--world-size-trainers",
+        type=int,
+        required=True,
+        help="Distributed World Size for collective communication library",
+    )
+
+    parser.add_argument(
+        "--oracle-prefix",
+        type=str,
+        default="oracle",
+        help="Prefix to name oracle cacher",
+    )
+
+    parser.add_argument(
+        "--trainer-prefix",
+        type=str,
+        default="worker",
+        help="prefix to call the trainer",
+    )
+
+    parser.add_argument(
+        "--emb-prefix",
+        type=str,
+        default="emb_worker",
+        help="Name of embedding worker Currently I am assuming there is currently only one worker ID",
+    )
+
+    parser.add_argument(
+        "--logging-prefix", type=str, default="test", help="Add for logging"
+    )
+
+    parser.add_argument(
+        "--cleanup-batch-proportion",
+        type=float,
+        default=0.25,
+        help="The proportion of lookahead value at which we evict and fetch",
+    )
+
+    parser.add_argument(
+        "--hot-emb-file", type=str, required=True, help="File for hot embeddings in fae"
+    )
+
+    parser.add_argument("--stop-iter", type=int, default=1000, help="Add for logging")
+    parser.add_argument("--emb-info-file", type=str, default=None)
+    args = parser.parse_args()
+    if args.emb_info_file is not None:
+        args.ln_emb = get_emb_length(args.emb_info_file)
+    return args
+
+
+if __name__ == "__main__":
+    args = parse_args(argparse.ArgumentParser(description="Arguments for DLRM"))
+    logging.basicConfig(
+        filename=f"training_worker_{args.dist_worker_id}_{args.logging_prefix}.log"
+    )
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    logger.info(args)
+    main(args)
